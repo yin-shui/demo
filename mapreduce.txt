@@ -1,0 +1,124 @@
+mem:8*16=128   avamem:11*8=88  core:8*4  虚拟cpu:64
+
+yarn.resourcemanager.scheduler.class=org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacityScheduler
+一、调度器  https://www.cnblogs.com/frankdeng/p/9311474.html
+            https://blog.csdn.net/qq_21383435/article/details/82659947
+hadoop调度器的作用是将系统中空闲的资源按一定策略分配给作业。调度器是一个可插拔的模块，用户可以根据自己的实际应用要求设计调度器
+1.基于队列的FIFO(先进先出)
+  hadoop默认的资源调度器。优点：简单明了。缺点：忽略了不同作业的需求差异
+2.计算能力调度器 CapacityScheduler
+  支持多个队列，每个队列可配置一定的资源量，每个队列采用FIFO调度策略，为了防止同一个用户的作业独占队列中的资源，
+  该调度器会对同一用户提交的作业所占资源量进行限定。选择占用最小、优先级高的先执行
+3.公平调度器Fair Scheduler
+  公平调度是一种赋予作业（job）资源的方法，它的目的是让所有的作业随着时间的推移，都能平均的获取等同的共享资源。所有的 job 具有相同的资源
+  当单独一个作业在运行时，它将使用整个集群。当有其它作业被提交上来时，系统会将任务（task）空闲资源（container）赋给这些新的作业，以使得每一个作业都大概获取到等量的CPU时间
+  与Hadoop默认调度器维护一个作业队列不同，这个特性让小作业在合理的时间内完成的同时又不"饿"到消耗较长时间的大作业
+
+CapacityScheduler相关参数：
+yarn.scheduler.capacity.root.default.capacity：一个百分比的值，表示占用整个集群的百分之多少比例的资源，这个queue-path下所有的capacity之和是100
+yarn.scheduler.capacity.root.default.user-limit-factor：每个用户的低保百分比，比如设置为1，则表示无论有多少用户在跑任务，每个用户占用资源最低不会少于1%的资源
+yarn.scheduler.capacity.root.default.maximum-capacity：弹性设置，最大时占用多少比例资源
+yarn.scheduler.capacity.root.default.state：队列状态，可以是RUNNING或STOPPED
+yarn.scheduler.capacity.root.default.acl_submit_applications：哪些用户或用户组可以提交人物
+yarn.scheduler.capacity.root.default.acl_administer_queue：哪些用户或用户组可以管理队列
+
+二、hadoop流程
+1、资源申请 http://dongxicheng.org/mapreduce-nextgen/understand-yarn-container-concept/
+            https://www.cnblogs.com/qingyunzong/p/8615096.html
+步骤1：用户将应用程序提交到ResourceManager上；
+步骤2：ResourceManager为应用程序ApplicationMaster申请资源，并与某个NodeManager通信，以启动ApplicationMaster；
+步骤3：ApplicationMaster与ResourceManager通信，为内部要执行的任务申请资源，一旦得到资源后，将于NodeManager通信，以启动对应的任务。
+步骤4：所有任务运行完成后，ApplicationMaster向ResourceManager注销，整个应用程序运行结束。
+
+yarn负责整个集群资源调度:
+NM资源配置:
+yarn.nodemanager.resource.memory-mb为每个节点分配的可用内存,单位MB,默认值为-1，代表着YARN的NodeManager占总内存的80%,不可动态修改(一个节点上的内存会被若干个服务共享，比如一部分给YARN，一部分给HDFS，一部分给HBase等);
+yarn.nodemanager.vmem-pmem-ratio为任务每使用1MB物理内存，最多可使用虚拟内存量，默认是2.1;
+RM资源配置:
+yarn.scheduler.minimum-allocation-mb单个任务可申请最少内存,默认1024(理论申请最大Container为 avamem/minimum)
+yarn.scheduler.maximum-allocation-mb单个任务可申请最大内存,默认8192(如果要跑spark任务，需要调大最大内存，因为spark的worker内存需要较大)
+AM资源配置:(以MapReduce为例进行说明)
+mapreduce.map.memory.mb每个Map任务的物理内存限制
+mapreduce.reduce.memory.mb每个Reduce任务的物理内存限制
+这两个参数用于指定map和reduce任务的物理内存大小，其值应该在RM中的最大最小container之间，
+如果没有配置则通过如下简单公式获得：max(MIN_CONTAINER_SIZE,(Total Available RAM)/containers)),一般的reduce应该是map的2倍;
+mapreduce.map.java.opts=-Xmx947m,启动JVM虚拟机时,传递给虚拟机的启动参数,表示这个Java程序可以使用的最大堆内存数,一定要小于mapreduce.map.memory.mb
+mapreduce.reduce.java.opts=-Xmx1894m 此参数要小于mapreduce.reduce.memory.mb,一般是 0.8 * mapreduce.reduce.memory.mb
+这两个参主要是为需要运行JVM程序（java、scala等）准备的，通过这两个设置可以向JVM中传递参数的，与内存有关的是，-Xmx，-Xms等选项。
+此数值大小，应该在AM中的map.mb和reduce.mb之间
+
+每个节点的Container允许的最大数量:Container数量=min (2*CORES, 1.8*DISKS, (可用内存)/最低Container的大小)
+每个Container的内存大小:每个Container的内存大小 = max(最小Container内存大小, (总可用内存) /Container数))
+
+tez计算框架中用hive.tez.container.size控制container大小
+
+
+2.mapreduce   mapreduce实际的处理过程可以理解为Input->Map->Sort->Combine->Partition->Reduce->Output
+              https://blog.csdn.net/aijiudu/article/details/72353510
+			  https://blog.csdn.net/poorguy_tn/article/details/82110122
+			  https://www.cnblogs.com/yjt1993/p/9480201.html
+(1)input 输入文件，hdfs读取数据，设置读取目录文件的线程数mapreduce.input.fileinputformat.list-status.num-threads可同时读取多文件，
+   加快文件传输速度，根据文件大小和数量合并或切割文件(input split)，决定map数目。
+   大文件切割：参数mapreduce.input.fileinputformat.split.minsiz(tez.grouping.min-size)、
+               mapreduce.input.fileinputformat.split.maxsize(tez.grouping.max-size)和dfs.blocksize决定切割大小
+			   计算公式：splitSize =  Math.max(minSize, Math.min(maxSize, blockSize));
+   小文件合并：hive.input.format=org.apache.hadoop.hive.ql.io.CombineHiveInputFormat
+               mapreduce.input.fileinputformat.split.minsize.per.node、mapreduce.input.fileinputformat.split.minsize.per.rack以及
+			   上面两个切割参数控制输入文件的合并
+(2)map task 将输入数据转换成键值对(键值对<k1,v1>)作为map输入，通过map函数处理后输出新键值对(键值对<k2,v2>)作为map输出
+(3)Kvbuffer 每一个map task有一个环形内存缓冲区，用于存放map的输出，但没有排序，默认大小100MB（mapreduce.task.io.sort.mb属性），
+            一旦达到阀值0.8(mapreduce.map.sort.spill.percent,因为spill的时候还有可能别的线程在往里写数据,有20%预留空间可以继续写入)，
+            一个后台线程就把溢出(spill)内容写到Linux本地磁盘中的指定目录(mapreduce.cluster.local.dir),当超过阈值时，Map任务不会
+			因为缓存溢出而被阻塞。但如果达到硬限制，Map任务会被阻塞，直到溢出行为结束。缓存的好处就是减少磁盘I/O的开销，提高合并和排序的速度，
+(4)spill 线程溢出分三个步骤：线程先将记录基于键进行分区partition(通过hive.mapred.partitioner设置分区算法的类,默认值org.apache.hadoop.hive.ql.io.DefaultHivePartitioner)
+         然后在内存中将每个分区的记录按键排序sort(通过map.sort.class指定排序算法，默认快速排序org.apache.hadoop.util.QuickSort)，
+		 最后对排序后的数据进行combine(如果有Combiner)，输出一个溢出文件
+(5)merge 在MapTask结束前会对这些spill文件进行合并(各个文件会按键排序后合并到一个分区且排序的文件)，这个过程就是merge的过程,
+         合并文件的流的数量通过mapreduce.task.io.sort.factor指定，默认10，即同时打开10个文件执行合并
+   注1：如果指定了Combiner，可能在两个地方被调用
+       1.当为作业设置Combiner类后，缓存溢出线程将缓存存放到磁盘时，就会调用；
+	   2.缓存溢出的数量超过mapreduce.map.combine.minspills（默认3）时，在缓存溢出文件合并的时候会调用Combiner
+   注2：中间数据压缩：减少磁盘IO和网络IO还可以进行压缩，对spill，merge文件都可以进行压缩，通过mapreduce.map.output.compress(default：false)
+        设置为true进行压缩，数据会被压缩写入磁盘，读数据读的是压缩数据需要解压，用mapreduce.map.output.compress.codec指定压缩方式，
+		这个过程会消耗CPU，适合IO瓶颈比较大的(Hive在Hadoop的运行的瓶颈一般都是IO而不是CPU)。
+(6)copy Reducer需要通过网络获取Map任务的输出结果，然后才能执行Reduce任务,由于map结果是分区有序的，所以可以先尝试从完成的map中
+        下载该reduce对应的partition部分数据，因此map和reduce是交叉进行的，其实就是shuffle，并且reduce需要从多个map获取数据，
+		一旦map任务完成之后，就会通过常规心跳通知应用程序的Application Master，reduce的一个线程会周期性地向master询问，直到提取完
+		所有数据，数据被reduce提走之后，map机器不会立刻删除数据，这是为了预防reduce任务失败需要重做，因此map输出数据是在
+		整个作业完成之后才被删除掉的，设置mapreduce.job.reduce.slowstart.completedmaps决定开始reduce copy任务(默认0.8）
+		即完成map任务比例为0.8时开始copy，设置mapreduce.tasktracker.http.threads(默认10,为server端的map用于提供数据传输的线程数)
+		和mapreduce.reduce.shuffle.parallelcopies(默认5,决定作为client端的Reduce同时从Map端拉取数据的并行度)决定copy线程数,
+		适合map很多并且完成的比较快的job的情况下调大，通过mapreduce.reduce.shuffle.read.timeout（default180000毫秒）设置reduce的
+		最大的下载时间，防止发生机器故障下载失败导致下载线程无休止等待。
+(7)mergesort Copy过来的数据会先放入内存缓冲区中，然后当使用内存达到一定量的时候才spill磁盘，这里的缓冲区大小要比map端的更为灵活，
+             它基于JVM的heap size设置，设置mapreduce.reduce.shuffle.input.buffer.percent(default 0.7)限制shuffile在reduce内存中的
+			 数据最多使用内存量为0.7 × maxHeap of reduce task(缓冲区为JVM的heapsize的70%)，reduce task的最大heap使用量通过
+			 mapreduce.admin.reduce.child.java.opts(或者mapred.reduce.child.java.opts)来设置，mapreduce.reduce.shuffle.merge.percent
+			 (default0.66)决定缓存溢出到磁盘的阈值,mapreduce.reduce.merge.inmem.threshold(默认1000)设置了Map任务在缓存溢出前能够
+			 保留在内存中的输出个数的阈值,只要一个满足,输出数据都将会溢出写到磁盘(溢出文件会做合并排序),如果map的输出结果进行了压缩，
+			 则在合并过程中，需要在内存中解压后才能给进行合并,当所有map输出都拷贝完毕之后，所有数据被最后合并成一个整体有序的文件，
+			 作为reduce任务的输入,通过mapreduce.task.io.sort.factor(default：10)来配置合并因子的值(同时合并的文件流的数量)。
+(8)reduce 当reduce将所有的map上对应自己partition的数据下载完成后，就会开始真正的reduce计算阶段,由于reduce计算时也是需要消耗内存的，
+          而在读取reduce需要的数据时，同样是需要内存作为buffer,设置mapreduce.reduce.input.buffer.percent(default 0.0)决定reducer
+		  需要多少的内存百分比来作为reduce读已经sort好的数据的buffer大小,默认0，也就是默认情况下reduce是全部从磁盘开始读处理数据，
+		  如果这个参数大于0，那么就会有一定量的数据被缓存在内存并输送给reduce，当reduce计算逻辑消耗内存很小时，可以分一部分内存
+		  用来缓存数据，可以提升计算的速度，如果内存足够大的话，务必设置该参数让reduce直接从缓存读数据，这就有点Spark Cache的感觉，
+		  Reducer的输出是没有排序的。
+		  通过设置hive.exec.reducers.bytes.per.reducer(每个reduce任务处理的数据量，默认为1000^3=1G)和hive.exec.reducers.max
+		  (每个任务最大的reduce数，默认为999)来确定reduce个数，计算公式：N=min(maxnum，总输入数据量/per bytes)
+		  或者设置mapred.reduce.tasks/mapreduce.job.reduces直接指定reduce个数
+(9)output 对最后的输出结果可以做压缩和合并(小文件)
+
+
+相关调优:https://blog.csdn.net/tototuzuoquan/article/details/80671128
+         1.给shuffle过程分配尽可能大的内存(前提需要确保map和reduce有足够的内存来运行业务逻辑)，运行map和reduce任务的JVM，
+           内存通过mapred.child.java.opts属性来设置，尽可能设大内存
+		 2.Hadoop默认使用4KB作为缓冲，这个算是很小的，可以通过io.file.buffer.size来调高缓冲池大小
+		 3.推测执行：mapred.map.tasks.speculative.execution和mapred.reduce.tasks.speculative.execution是两个推测式执行的配置项,
+		   默认是true，所谓的推测执行，就是当所有task都开始运行之后，Job Tracker会统计所有任务的平均进度，如果某个task所在的
+		   task node机器配置比较低或者CPU load很高（原因很多），导致任务执行比总体任务的平均执行要慢，此时Job Tracker会启动一个
+		   新的任务（duplicate task），原有任务和新任务哪个先执行完就把另外一个kill掉，这也是我们经常在Job Tracker页面看到任务
+		   执行成功，但是总有些任务被kill，就是这个原因
+		
+
+
